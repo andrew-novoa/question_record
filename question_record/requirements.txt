@@ -1,0 +1,10 @@
+numpy
+simpleaudio
+sounddevice
+soundfile
+basic_pitch
+mido
+music21
+pedalboard
+pydub
+scipy

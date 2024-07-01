@@ -1,6 +1,5 @@
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' # Suppress TensorFlow logging (1)
-import random
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -10,23 +9,25 @@ import sounddevice as sd
 import soundfile as sf
 from basic_pitch.inference import predict
 from mido import MetaMessage, MidiFile, bpm2tempo
-from music21 import converter, note, pitch, stream
+from music21 import chord, converter, harmony, note, pitch, stream
 from pedalboard import Compressor, Gain, Limiter, Pedalboard
 from pydub import AudioSegment
 from scipy.io.wavfile import write
 
-from qa_generate.excerpt_test_2 import generate_excerpt
+from qa_util import generate_chord_progression, generate_excerpt
+
 
 ### Main function
-def record_and_grade(in_time=True, fs=44100, excerpt=None, bpm=120, count_in=2):
+def record_and_grade(in_time=True, fs=44100, excerpt=None, exact=True, bpm=120, count_in=2, score_threshold=0.8):
 
-    quarter_bpm = calculate_quarter_bpm(bpm, excerpt.timeSignature) # Calculate the quarter note BPM for the MIDI file
+    quarter_bpm = calculate_quarter_bpm(bpm, excerpt.flat.timeSignature) # Calculate the quarter note BPM for the MIDI file
     full_duration = get_score_duration(excerpt, bpm, count_in=count_in)  # seconds
     highest_freq, lowest_freq = get_score_pitch_range(excerpt) # Hz
     min_note_length_ms = get_score_min_note_length(excerpt, bpm) # milliseconds
     board = Pedalboard([Compressor(threshold_db=-20, ratio=8, attack_ms=10, release_ms=min_note_length_ms), 
                         Gain(gain_db=8), Limiter(threshold_db=-10, release_ms=min_note_length_ms)])
-    
+    written_chords = True if len([e for e in excerpt.flatten().getElementsByClass(chord.Chord).stream() if 'ChordSymbol' not in e.classSet]) > 0 else False
+
     # Record user audio and save as WAV file
     user_recording, metronome_np_array = record_with_metronome(excerpt, bpm, count_in, fs, full_duration) if in_time else record_without_metronome(fs=fs)
     output_filename_wav = 'user_recordings/output.wav'
@@ -42,14 +43,15 @@ def record_and_grade(in_time=True, fs=44100, excerpt=None, bpm=120, count_in=2):
     # Basic Pitch
     model_output, midi_data, note_events = predict(processed_wav_file,
                                                    onset_threshold=0.1 if in_time else 0.7,
-                                                   frame_threshold=0.2 if in_time else 0.5, 
+                                                   frame_threshold=0.2 if in_time else 0.3 if written_chords else 0.5, 
                                                    midi_tempo=quarter_bpm if in_time else 120,
                                                    maximum_frequency=highest_freq,
                                                    minimum_frequency=lowest_freq,
                                                    minimum_note_length=min_note_length_ms if in_time else 50,
-                                                   melodia_trick=True
+                                                   melodia_trick=True,
+                                                   debug_file='debug.txt'
                                                    )
-    
+
     # Write and format MIDI file
     midi_data.write(output_filename_midi)
     user_midi = format_user_midi(MidiFile(output_filename_midi), 
@@ -64,61 +66,57 @@ def record_and_grade(in_time=True, fs=44100, excerpt=None, bpm=120, count_in=2):
     user_m21_stream_formatted.show()
 
     # Compare music21 streams - True if the user played the excerpt correctly, False if not
-    return compare_m21_streams(excerpt, user_m21_stream_formatted, in_time)
+    return compare_m21_streams(excerpt, user_m21_stream_formatted, exact, in_time, score_threshold)
 
 ### Music21 functions
-def compare_m21_streams(original_stream, user_stream, in_time=False):
-    def correct_note_check(original_note, user_note):
-        if original_note.isRest and user_note.isRest:
-            return False
-        elif original_note.isRest and not user_note.isRest or not original_note.isRest and user_note.isRest:
-            return False
-        elif user_note.pitch.isEnharmonic(original_notes[index].pitch):
-            return True
+def compare_m21_streams(original_stream, user_stream, exact=True, in_time=False, score_threshold=0.8):
+    if user_stream is None or len(user_stream.flatten().getElementsByClass(note.Note).stream()) == 0:
+        raise ValueError('User stream is empty')
+    
+    original_notes_list = [o for o in original_stream.flatten().getElementsByClass([note.Note, chord.Chord]).stream() if 'ChordSymbol' not in o.classSet]
 
     if in_time:
+        if original_stream.timeSignature is None:
+            raise ValueError('Original stream does not have a time signature')
+        
         ### Iterate over each beat in the original stream and determine a percentage-based score based on how many notes the user got correct
         correct_notes = 0
         beat_offset_list = original_stream.timeSignature.getBeatOffsets()
         beat_offset_list.append(original_stream.timeSignature.barDuration.quarterLength)
 
-        for m in range(len(original_stream.getElementsByClass(stream.Measure))):
+        for m in range(min(len(original_stream.getElementsByClass(stream.Measure)), len(user_stream.getElementsByClass(stream.Measure)))):
             for num, b in enumerate(beat_offset_list[:-1]):
                 user_notes = [u for u in user_stream.measure(m + 1).getElementsByOffset(b, beat_offset_list[num + 1], 
                                                                             includeEndBoundary=False, mustFinishInSpan=False, 
                                                                             mustBeginInSpan=False, includeElementsThatEndAtStart=False, 
-                                                                            classList=(note.Note, note.Rest))]
+                                                                            classList=(note.Note, note.Rest, chord.Chord)) if 'ChordSymbol' not in u.classSet]
                 original_notes = [o for o in original_stream.measure(m + 1).getElementsByOffset(b, beat_offset_list[num + 1],
                                                                                     includeEndBoundary=False, mustFinishInSpan=False,
                                                                                     mustBeginInSpan=False, includeElementsThatEndAtStart=False,
-                                                                                    classList=(note.Note, note.Rest))]
+                                                                                    classList=(note.Note, note.Rest, chord.Chord)) if 'ChordSymbol' not in o.classSet]
 
                 for index, original_note in enumerate(original_notes):
-                    correct_notes += 1 if original_note.offset == b and correct_note_check(original_note, user_notes[index]) == True else 0
-                    
-        score = correct_notes / (len(original_stream.flatten().getElementsByClass(note.Note).stream()))
+                    check_function = correct_chord_check if original_note.isChord else correct_note_check
+                    correct_notes += 1 if original_note.offset == b and check_function(original_note, user_notes[index], exact) == True else 0
+    
+        score = correct_notes / (len(original_notes_list))
 
     else:
-        wrong_notes = 0
-        original_notes = original_stream.flatten().getElementsByClass(note.Note).stream()
-        user_notes = user_stream.flatten().getElementsByClass(note.Note).stream()
-        for index, s in enumerate(original_notes):
-            if len(user_notes) < index:
-                break
-            if user_notes[index].tie is not None:
-                user_notes.pop(index)
-            while s.pitch.isEnharmonic(user_notes[index].pitch) == False:
-                if len(user_notes) < index:
-                    break
-                user_notes.pop(index)
-                wrong_notes += 1
-        score = (len(original_notes) - wrong_notes) / len(original_notes)
-
-    # print(f"Score: {round(score * 100, 2)}")
-    return True if score >= 0.8 else False
+        user_notes = [u for u in user_stream.flatten().getElementsByClass([note.Note, chord.Chord]).stream() if 'ChordSymbol' not in u.classSet]
+        original_notes = [o for o in original_stream.flatten().getElementsByClass([note.Note, chord.Chord]).stream() if 'ChordSymbol' not in o.classSet]
+        # print(original_notes, user_notes)
+        distance, insertions, deletions, substitutions = levenshtein_distance(original_notes, user_notes, exact=exact)
+        # print(f"Distance: {distance}, Insertions: {insertions}, Deletions: {deletions}, Substitutions: {substitutions}")
+        score = max(0, (len(original_notes_list) - distance) / len(original_notes_list))
+    # print(score)
+    return True if score >= score_threshold else False
 
 def format_user_stream(user_stream, original_stream, count_in_measures=2, in_time=False):
-    user_stream = user_stream.parts[0]
+
+    if user_stream is None or len([u for u in user_stream.flatten().getElementsByClass([note.Note, chord.Chord]).stream() if 'ChordSymbol' not in u.classSet]) == 0:
+        raise ValueError('User stream is empty')
+
+    user_stream = user_stream.parts[0].flat.notesAndRests.stream()
 
     if in_time:
         original_stream_duration_list = []
@@ -142,25 +140,57 @@ def format_user_stream(user_stream, original_stream, count_in_measures=2, in_tim
                                         processOffsets=True, processDurations=True, recurse=True)
         
         ### Remove any notes that are outside of the time signature of the original excerpt
-        for u in user_stream.flatten().getElementsByClass([note.Note, note.Rest]):
-            if u.offset > original_stream.timeSignature.duration.quarterLength:
+        for u in user_stream.flatten().getElementsByClass([note.Note, note.Rest, chord.Chord]).stream():
+            if 'ChordSymbol' not in u.classSet and u.offset > original_stream.timeSignature.duration.quarterLength:
                 user_stream.remove(u)
     
     else:
-        user_notes = user_stream.flatten().getElementsByClass(note.Note)
+        user_notes = [u for u in user_stream.flatten().getElementsByClass([note.Note, chord.Chord]).stream() if 'ChordSymbol' not in u.classSet]
         for index, u in enumerate(user_notes):
             if index < (len(user_notes) - 1) and u.offset == user_notes[index + 1].offset:
                 user_stream.remove(u if u.tie is None or u.duration.quarterLength < user_notes[index + 1].duration.quarterLength else user_notes[index + 1])
-        
-    user_stream = user_stream.makeNotation()
+            # Remove tied notes that are not the first in the tie and remove the tie from the first note
+            elif u.tie:
+                if u.tie.type != 'start':
+                    user_stream.remove(u)
+                else:
+                    u.tie = None
 
     return user_stream
 
+def correct_note_check(original_note, user_note, exact=True):
+    if original_note.isRest and user_note.isRest:
+        return False
+    elif original_note.isRest and not user_note.isRest or not original_note.isRest and user_note.isRest:
+        return False
+    elif user_note.pitch.isEnharmonic(original_note.pitch) or user_note.pitch == original_note.pitch:
+        return True
+    else:
+        return False
+    
+def correct_chord_check(original_chord, user_chord, exact=True):
+    if not user_chord.isChord:
+        return False
+    
+    if exact:
+        if len(original_chord.pitches) != len(user_chord.pitches):
+            return False
+        else:
+            for index, pitch in enumerate(original_chord.pitches):
+                if not user_chord.pitches[index].isEnharmonic(pitch):
+                    return False
+            return True
+    else:
+        return True if harmony.chordSymbolFigureFromChord(original_chord) == harmony.chordSymbolFigureFromChord(user_chord) else False
+    
 ### MIDI function
 def format_user_midi(user_midi_file, original_stream, bpm, output_filename_midi):
+    if user_midi_file is None:
+        raise ValueError('User midi file is empty')
+
     # Set the tempo and time signature of the user's midi file to match the original excerpt
     set_user_tempo = MetaMessage('set_tempo', tempo=bpm2tempo(bpm))
-    set_time_signature = MetaMessage('time_signature', numerator=original_stream.timeSignature.numerator, denominator=original_stream.timeSignature.denominator)
+    set_time_signature = MetaMessage('time_signature', numerator=original_stream.flat.timeSignature.numerator, denominator=original_stream.flat.timeSignature.denominator)
     
     for i, msg in enumerate(user_midi_file.tracks[0]):
         if msg.type == 'set_tempo':
@@ -195,6 +225,10 @@ def process_audio(audio_file, audio_fx, metronome_numpy_array = None):
 
         return cancelled_audio
 
+    if audio_file is None or len(audio_file) == 0:
+        raise ValueError('User audio file is empty')
+    
+    # Read the audio file
     audio, sample_rate = sf.read(audio_file)
 
     # Check if there's a metronome audio file, if so, phase cancel it
@@ -225,6 +259,9 @@ def record_with_metronome(music21_stream, bpm, count_in, fs, score_duration):
         time.sleep(score_duration)  # Wait for the recording to finish
         sd.stop()  # Stop the recording
         return recording
+    
+    if music21_stream is None or len(music21_stream.flatten().getElementsByClass([note.Note, note.Rest]).stream()) == 0:
+        raise ValueError('Music21 stream is empty')
     
     metronome_WaveObject, metronome_np_array = generate_metronome_track(music21_stream, bpm, count_in, fs)
 
@@ -275,6 +312,9 @@ def generate_metronome_track(music21_stream, bpm=120, count_in=0, fs=44100):
 
         return delay
 
+    if music21_stream is None or len(music21_stream.flatten().getElementsByClass([note.Note, note.Rest]).stream()) == 0:
+        raise ValueError('Music21 stream is empty')
+    
     # Load metronome sounds
     strong_beat = np.array(AudioSegment.from_wav('metronome_clicks/src_strong_beat.wav').get_array_of_samples())
     sub_strong_beat = np.array(AudioSegment.from_wav('metronome_clicks/src_sub_strong_beat.wav').get_array_of_samples())
@@ -282,7 +322,7 @@ def generate_metronome_track(music21_stream, bpm=120, count_in=0, fs=44100):
 
     bpms, bpms_measure_numbers = get_bpms_and_measure_numbers(music21_stream, bpm)
     number_of_measures = len(music21_stream.getElementsByClass('Measure')) + count_in
-    time_signature = music21_stream.timeSignature
+    time_signature = music21_stream.flat.timeSignature
 
     metronome_track = []
     for m in range(number_of_measures):
@@ -311,6 +351,48 @@ def generate_metronome_track(music21_stream, bpm=120, count_in=0, fs=44100):
     return metronome_track_WaveObject, metronome_track_numpy_array
 
 ### Auxiliary functions
+def levenshtein_distance(s1, s2, exact=True):
+    """Calculates the Levenshtein distance between two sequences and counts insertions, deletions, and substitutions, using correct_note_check and correct_chord_check for comparison."""
+    len_s1, len_s2 = len(s1), len(s2)
+    dp = [[0 for _ in range(len_s2 + 1)] for _ in range(len_s1 + 1)]
+    
+    for i in range(len_s1 + 1):
+        for j in range(len_s2 + 1):
+            if i == 0:
+                dp[i][j] = j
+            elif j == 0:
+                dp[i][j] = i
+            elif (s1[i - 1].isNote and correct_note_check(s1[i - 1], s2[j - 1])) or \
+                 (s1[i - 1].isChord and correct_chord_check(s1[i - 1], s2[j - 1], exact=exact)):
+                dp[i][j] = dp[i - 1][j - 1]
+            else:
+                dp[i][j] = 1 + min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1])
+    
+    # Backtrack to find the number of insertions, deletions, and substitutions
+    i, j = len_s1, len_s2
+    insertions, deletions, substitutions = 0, 0, 0
+    
+    while i > 0 and j > 0:
+        if (s1[i - 1].isNote and correct_note_check(s1[i - 1], s2[j - 1])) or \
+           (s1[i - 1].isChord and correct_chord_check(s1[i - 1], s2[j - 1], exact=exact)):
+            i -= 1
+            j -= 1
+        elif dp[i][j] == dp[i - 1][j - 1] + 1:
+            substitutions += 1
+            i -= 1
+            j -= 1
+        elif dp[i][j] == dp[i - 1][j] + 1:
+            deletions += 1
+            i -= 1
+        elif dp[i][j] == dp[i][j - 1] + 1:
+            insertions += 1
+            j -= 1
+    
+    insertions += j
+    deletions += i
+    
+    return dp[len_s1][len_s2], insertions, deletions, substitutions
+
 def calculate_quarter_bpm(original_bpm, time_signature):
     # Get the denominator from the time signature
     denominator = time_signature.denominator
@@ -336,11 +418,12 @@ def calculate_quarter_bpm(original_bpm, time_signature):
         return quarter_bpm
 
 def get_score_duration(excerpt, bpm, count_in=0):
+    time_signature = excerpt.flat.timeSignature
     number_of_measures = len(excerpt.getElementsByClass(stream.Measure))
-    if excerpt.timeSignature.denominator == 8:
-        quarter_length = excerpt.timeSignature.numerator / 2
+    if time_signature.denominator == 8:
+        quarter_length = time_signature.numerator / 2
     else:
-        quarter_length = excerpt.timeSignature.numerator
+        quarter_length = time_signature.numerator
     measure_duration = 60 * quarter_length / bpm  # measure duration in seconds
     return measure_duration * (number_of_measures + count_in)  # full score duration in seconds
 
@@ -348,29 +431,29 @@ def get_score_pitch_range(excerpt):
     highest_pitch = 0
     lowest_pitch = 127
     pitch_padding = 5
-    for n in excerpt.flatten().getElementsByClass(note.Note):
-        if n.pitch.midi > highest_pitch:
-            highest_pitch = n.pitch.midi
-        elif n.pitch.midi < lowest_pitch:
-            lowest_pitch = n.pitch.midi
+    for n in excerpt.flatten().getElementsByClass([note.Note, chord.Chord]).stream():
+        if n.isNote:
+            if n.pitch.midi > highest_pitch:
+                highest_pitch = n.pitch.midi
+            elif n.pitch.midi < lowest_pitch:
+                lowest_pitch = n.pitch.midi
+        elif n.isChord and 'ChordSymbol' not in n.classSet:
+            sorted_chord = n.sortDiatonicAscending()
+            if sorted_chord[-1].pitch.midi > highest_pitch:
+                highest_pitch = sorted_chord[-1].pitch.midi
+            elif sorted_chord[0].pitch.midi < lowest_pitch:
+                lowest_pitch = sorted_chord[0].pitch.midi
 
-    highest_freq = round(pitch.Pitch(midi=highest_pitch + pitch_padding).frequency)
-    lowest_freq = round(pitch.Pitch(midi=lowest_pitch - pitch_padding).frequency)
+    highest_freq = round(pitch.Pitch(midi=highest_pitch + pitch_padding).frequency) if highest_pitch >= 55 else 1000 #Hz
+    lowest_freq = round(pitch.Pitch(midi=lowest_pitch - pitch_padding).frequency) if lowest_pitch <= 79 else 200 #Hz
 
     return highest_freq, lowest_freq
 
 def get_score_min_note_length(excerpt, bpm):
     min_note_length_ms = 999999999
     quarter_length_milliseconds = 60 * 1000 / bpm
-    for n in excerpt.flatten().getElementsByClass(note.Note):
+    score_notes_and_chords = [n for n in excerpt.flatten().getElementsByClass([note.Note, chord.Chord]).stream() if 'ChordSymbol' not in n.classSet]
+    for n in score_notes_and_chords:
         if n.quarterLength * quarter_length_milliseconds < min_note_length_ms:
             min_note_length_ms = n.quarterLength * quarter_length_milliseconds
     return min_note_length_ms
-
-### Import the excerpt
-excerpt = generate_excerpt(input_time_sig=[[4],[4]], input_key_sig=[random.choice([-1, 0, 1])], input_length=3, input_subdivision=4) # Generate a random excerpt (this is an updated function from excerpt_test_2 that I will add to the previous repos soon)
-excerpt.show()
-
-# Record and grade the user's performance
-if input("Press enter to start recording:") == '':
-    print(record_and_grade(in_time=True, excerpt=excerpt, bpm=100, count_in=2))
